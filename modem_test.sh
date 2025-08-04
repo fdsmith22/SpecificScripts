@@ -13,6 +13,8 @@ NC='\033[0m' # No Color
 
 # Global variables
 MODEM_PORT="/dev/ttyUSB2"  # AT command port based on ModemManager info
+DETECTED_MODEM_NUM=""      # Will be set dynamically during modem detection
+ACTIVE_MODEM_NUM=""        # Current working modem number (may change during test)
 LOCATION=""
 LOCATION_NAME=""
 LOG_FILE=""
@@ -92,20 +94,74 @@ install_dependencies() {
     
     echo -e "${GREEN}Dependencies ready!${NC}"
     
-    # Check ModemManager availability
+    # Check ModemManager availability and get modem number
     echo -e "${YELLOW}Checking ModemManager...${NC}"
     if which mmcli > /dev/null; then
-        if mmcli -L 2>/dev/null | grep -q "Modem"; then
-            echo -e "${GREEN}ModemManager detected - using hybrid approach${NC}"
+        # Check if ModemManager is running
+        MM_STATUS=$(systemctl is-active ModemManager 2>/dev/null)
+        if [ "$MM_STATUS" = "active" ]; then
+            echo -e "${GREEN}ModemManager is active${NC}"
             
-            # Get basic modem info
-            echo -e "${YELLOW}Modem detected:${NC}"
-            mmcli -m 0 2>/dev/null | grep -E "(manufacturer|model|signal quality)" | head -3
+            # Scan for modems and get list
+            echo -e "${YELLOW}Scanning for modems...${NC}"
+            sudo mmcli --scan-modems >/dev/null 2>&1
+            sleep 3
+            
+            MODEM_LIST=$(sudo mmcli -L 2>/dev/null)
+            if echo "$MODEM_LIST" | grep -q "/Modem/"; then
+                # Extract modem number dynamically
+                MODEM_NUM=$(echo "$MODEM_LIST" | grep -o '/Modem/[0-9]*' | cut -d'/' -f3 | head -1)
+                echo -e "${GREEN}Modem detected: Modem $MODEM_NUM${NC}"
+                
+                # Get basic modem info to display
+                MODEM_INFO=$(sudo mmcli -m $MODEM_NUM 2>/dev/null)
+                echo "$MODEM_INFO" | grep -E "(manufacturer|model|signal quality)" | head -3
+                
+                # Set global modem number for use in send_at function
+                DETECTED_MODEM_NUM="$MODEM_NUM"
+            else
+                echo -e "${YELLOW}No modems found initially, waiting for initialization...${NC}"
+                echo -e "${YELLOW}Allowing 45 seconds for device initialization...${NC}"
+                
+                # Restart ModemManager to ensure clean state
+                sudo systemctl restart ModemManager
+                
+                # Wait for proper initialization
+                for i in {45..1}; do
+                    printf "\r   ${YELLOW}Initializing: %2d seconds remaining${NC}" $i
+                    sleep 1
+                done
+                echo ""
+                
+                # Force device scan after initialization
+                sudo mmcli --scan-modems >/dev/null 2>&1
+                sleep 3
+                
+                MODEM_LIST=$(sudo mmcli -L 2>/dev/null)
+                if echo "$MODEM_LIST" | grep -q "/Modem/"; then
+                    MODEM_NUM=$(echo "$MODEM_LIST" | grep -o '/Modem/[0-9]*' | cut -d'/' -f3 | head -1)
+                    echo -e "${GREEN}✅ Modem detected after initialization: Modem $MODEM_NUM${NC}"
+                    DETECTED_MODEM_NUM="$MODEM_NUM"
+                    
+                    # Show basic info
+                    MODEM_INFO=$(sudo mmcli -m $MODEM_NUM 2>/dev/null)
+                    echo "$MODEM_INFO" | grep -E "(manufacturer|model|signal quality)" | head -3
+                else
+                    echo -e "${RED}❌ No modems detected after initialization${NC}"
+                    echo -e "${YELLOW}Continuing with direct AT command fallback...${NC}"
+                    DETECTED_MODEM_NUM=""
+                fi
+            fi
         else
-            echo -e "${YELLOW}ModemManager available but no modems detected${NC}"
+            echo -e "${RED}ModemManager not active${NC}"
+            echo -e "${YELLOW}Starting ModemManager...${NC}"
+            sudo systemctl start ModemManager
+            sleep 5
+            DETECTED_MODEM_NUM=""
         fi
     else
         echo -e "${YELLOW}ModemManager not available - using direct AT commands${NC}"
+        DETECTED_MODEM_NUM=""
     fi
     
     # Test modem port connectivity only if ModemManager isn't managing it
@@ -130,12 +186,12 @@ send_at() {
         "RuralOnSite") timeout_val=10 ;;
     esac
     
-    # Try ModemManager first (works without sudo for most commands)
-    if which mmcli > /dev/null 2>&1; then
+    # Try ModemManager first (use detected modem number)
+    if which mmcli > /dev/null 2>&1 && [ -n "$DETECTED_MODEM_NUM" ]; then
         case "$cmd" in
             "AT+CSQ")
                 # Get signal strength via ModemManager
-                local mm_signal=$(mmcli -m 0 2>/dev/null | grep "signal quality" | grep -o '[0-9]\+%' | tr -d '%')
+                local mm_signal=$(sudo mmcli -m $DETECTED_MODEM_NUM 2>/dev/null | grep "signal quality" | grep -o '[0-9]\+%' | tr -d '%')
                 if [ -n "$mm_signal" ]; then
                     # Convert percentage to CSQ format (0-31)
                     local csq_val=$(echo "scale=0; $mm_signal * 31 / 100" | bc)
@@ -144,28 +200,28 @@ send_at() {
                 fi
                 ;;
             "AT+CGMI")
-                local mm_mfg=$(mmcli -m 0 2>/dev/null | grep "manufacturer:" | cut -d':' -f2 | xargs)
+                local mm_mfg=$(sudo mmcli -m $DETECTED_MODEM_NUM 2>/dev/null | grep "manufacturer:" | cut -d':' -f2 | xargs)
                 if [ -n "$mm_mfg" ]; then
                     echo "$mm_mfg"
                     return
                 fi
                 ;;
             "AT+CGMM")
-                local mm_model=$(mmcli -m 0 2>/dev/null | grep "model:" | cut -d':' -f2 | xargs)
+                local mm_model=$(sudo mmcli -m $DETECTED_MODEM_NUM 2>/dev/null | grep "model:" | cut -d':' -f2 | xargs)
                 if [ -n "$mm_model" ]; then
                     echo "$mm_model"
                     return
                 fi
                 ;;
             "AT+CGMR")
-                local mm_fw=$(mmcli -m 0 2>/dev/null | grep "firmware revision:" | cut -d':' -f2 | xargs)
+                local mm_fw=$(sudo mmcli -m $DETECTED_MODEM_NUM 2>/dev/null | grep "firmware revision:" | cut -d':' -f2 | xargs)
                 if [ -n "$mm_fw" ]; then
                     echo "$mm_fw"
                     return
                 fi
                 ;;
             "AT+CGSN")
-                local mm_imei=$(mmcli -m 0 2>/dev/null | grep "imei:" | cut -d':' -f2 | xargs)
+                local mm_imei=$(sudo mmcli -m $DETECTED_MODEM_NUM 2>/dev/null | grep "imei:" | cut -d':' -f2 | xargs)
                 if [ -n "$mm_imei" ]; then
                     echo "$mm_imei"
                     return
@@ -174,7 +230,7 @@ send_at() {
             "AT+CCID")
                 # Get ICCID via ModemManager SIM info
                 echo -e "${YELLOW}Getting ICCID requires sudo access...${NC}" >&2
-                local mm_iccid=$(sudo mmcli --sim 0 2>/dev/null | grep "iccid:" | cut -d':' -f2 | xargs)
+                local mm_iccid=$(sudo mmcli --sim $DETECTED_MODEM_NUM 2>/dev/null | grep "iccid:" | cut -d':' -f2 | xargs)
                 if [ -n "$mm_iccid" ]; then
                     echo "$mm_iccid"
                     return
@@ -183,7 +239,7 @@ send_at() {
             "AT+CIMI")
                 # Get IMSI via ModemManager SIM info  
                 echo -e "${YELLOW}Getting IMSI requires sudo access...${NC}" >&2
-                local mm_imsi=$(sudo mmcli --sim 0 2>/dev/null | grep "imsi:" | cut -d':' -f2 | xargs)
+                local mm_imsi=$(sudo mmcli --sim $DETECTED_MODEM_NUM 2>/dev/null | grep "imsi:" | cut -d':' -f2 | xargs)
                 if [ -n "$mm_imsi" ]; then
                     echo "$mm_imsi"
                     return
@@ -191,7 +247,7 @@ send_at() {
                 ;;
             "AT+CPIN?")
                 # Get SIM status via ModemManager
-                local sim_status=$(mmcli -m 0 2>/dev/null | grep "state:" | cut -d':' -f2 | xargs)
+                local sim_status=$(sudo mmcli -m $DETECTED_MODEM_NUM 2>/dev/null | grep "state:" | cut -d':' -f2 | xargs)
                 case "$sim_status" in
                     "connected"|"registered") echo "+CPIN: READY" ;;
                     "locked") echo "+CPIN: SIM PIN" ;;
@@ -200,15 +256,15 @@ send_at() {
                 return
                 ;;
             "AT+COPS?")
-                local mm_op=$(mmcli -m 0 2>/dev/null | grep "operator name:" | cut -d':' -f2 | xargs)
-                local mm_op_id=$(mmcli -m 0 2>/dev/null | grep "operator id:" | cut -d':' -f2 | xargs)
+                local mm_op=$(sudo mmcli -m $DETECTED_MODEM_NUM 2>/dev/null | grep "operator name:" | cut -d':' -f2 | xargs)
+                local mm_op_id=$(sudo mmcli -m $DETECTED_MODEM_NUM 2>/dev/null | grep "operator id:" | cut -d':' -f2 | xargs)
                 if [ -n "$mm_op" ]; then
                     echo "+COPS: 0,0,\"$mm_op\",7"
                     return
                 fi
                 ;;
             "AT+CREG?")
-                local mm_reg=$(mmcli -m 0 2>/dev/null | grep "registration:" | cut -d':' -f2 | xargs)
+                local mm_reg=$(sudo mmcli -m $DETECTED_MODEM_NUM 2>/dev/null | grep "registration:" | cut -d':' -f2 | xargs)
                 case "$mm_reg" in
                     "home") echo "+CREG: 0,1" ;;
                     "roaming") echo "+CREG: 0,5" ;;
@@ -326,12 +382,20 @@ connect_time_test() {
     echo "=== Connect Time Test ==="
     
     # Skip connect time test if ModemManager is managing the connection
-    if mmcli -m 0 2>/dev/null | grep -q "state: connected"; then
+    if [ -n "$DETECTED_MODEM_NUM" ] && sudo mmcli -m $DETECTED_MODEM_NUM 2>/dev/null | grep -q "state: connected"; then
         echo "Modem is managed by ModemManager - connect time test skipped"
         echo "Connection is actively managed, no manual connect/disconnect testing performed"
         echo "ModemManager handles reconnection automatically on network issues"
         
+        echo "Current connection statistics:"
+        sudo mmcli -m $DETECTED_MODEM_NUM 2>/dev/null | grep -E "(duration|bytes)" || echo "No connection stats available"
+        
         # Don't create connect_time.txt file - this will exclude it from CSV
+        return
+    elif [ -n "$DETECTED_MODEM_NUM" ]; then
+        echo "⚠️  WARNING: ModemManager detected but modem not in connected state"
+        echo "Skipping connect time test to avoid disrupting connection"
+        echo "Connect Time,N/A - Connection Protected,N/A,Avoiding disruption of active connection" >> /tmp/connect_note.txt
         return
     fi
     
@@ -604,7 +668,13 @@ generate_csv_results() {
             
             echo "Connect Time,${CONN_TIME}s,$CONN_SCORE,$CONN_TARGET" >> $RESULTS_FILE
         else
-            echo "Connect Time,N/A - MM Managed,N/A,ModemManager handles connections" >> $RESULTS_FILE
+            if [ -f /tmp/connect_note.txt ]; then
+                CONNECT_NOTE=$(cat /tmp/connect_note.txt)
+                echo "$CONNECT_NOTE" >> $RESULTS_FILE
+                rm -f /tmp/connect_note.txt
+            else
+                echo "Connect Time,N/A - MM Managed,N/A,ModemManager handles connections" >> $RESULTS_FILE
+            fi
         fi
     else
         echo "Connect Time,N/A - MM Managed,N/A,ModemManager handles connections" >> $RESULTS_FILE
@@ -790,10 +860,24 @@ main_tests() {
         echo "ModemManager not available" | tee -a $LOG_FILE
     fi
     
-    # Test 9: Power consumption info
+    # Test 9: Power consumption info (with better error handling)
     echo -e "${YELLOW}=== Power Status ===${NC}" | tee -a $LOG_FILE
+    
+    # Try to get power info from ModemManager first
+    if [ -n "$ACTIVE_MODEM_NUM" ] && sudo mmcli -m $ACTIVE_MODEM_NUM >/dev/null 2>&1; then
+        echo "Using ModemManager for power status:" | tee -a $LOG_FILE
+        sudo mmcli -m $ACTIVE_MODEM_NUM | grep -E "(power|state|temperature)" | tee -a $LOG_FILE || echo "Power info via MM not available" | tee -a $LOG_FILE
+    fi
+    
+    # Fallback to AT commands
     echo "Function Level: $(send_at 'AT+CFUN?')" | tee -a $LOG_FILE
     echo "Power Saving: $(send_at 'AT+CPSMS?')" | tee -a $LOG_FILE
+    
+    # Try temperature if available
+    TEMP_INFO=$(send_at 'AT+QTEMP')
+    if [ "$TEMP_INFO" != "No response" ]; then
+        echo "Temperature: $TEMP_INFO" | tee -a $LOG_FILE
+    fi
     
     # Generate CSV results
     generate_csv_results
